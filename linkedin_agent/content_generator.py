@@ -2,14 +2,21 @@
 AI Content Generator
 Uses Claude API to generate LinkedIn posts about AI & Data Engineering.
 Also generates contextual replies to comments and messages.
+
+Improvements:
+- Thread-safe topic cycling (was: race condition with _topic_index)
+- Full Anthropic API error handling (rate limits, connection errors, API errors)
+- Post length validation before returning
+- Proper logging instead of print statements
 """
 
+import threading
+import logging
 import anthropic
-from datetime import datetime
 from typing import Optional
 
+logger = logging.getLogger(__name__)
 
-# ── Topic bank for weekly AI/Data Engineering posts ──────────────────────────
 TOPIC_POOL = [
     "Building real-time data pipelines with Apache Kafka and Flink",
     "How AI agents are transforming data engineering workflows",
@@ -33,6 +40,9 @@ TOPIC_POOL = [
     "The impact of foundation models on traditional ETL pipelines",
 ]
 
+_MAX_POST_CHARS    = 3000
+_MAX_COMMENT_CHARS = 1250
+
 
 class ContentGenerator:
     """
@@ -53,9 +63,46 @@ His LinkedIn voice is:
 """
 
     def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = model
-        self._topic_index = 0  # Cycles through TOPIC_POOL week by week
+        self.client       = anthropic.Anthropic(api_key=api_key)
+        self.model        = model
+        self._topic_index = 0
+        self._topic_lock  = threading.Lock()   # Thread-safe cycling
+
+    # ──────────────────────────────────────────────
+    # Internal helpers
+    # ──────────────────────────────────────────────
+
+    def _call_claude(self, prompt: str, max_tokens: int) -> str:
+        """
+        Call Claude API with full error handling.
+        Raises on persistent failure so caller can decide recovery strategy.
+        """
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return message.content[0].text.strip()
+        except anthropic.RateLimitError as e:
+            logger.error("[ContentGen] ❌ Claude rate limit hit: %s", e)
+            raise
+        except anthropic.APIConnectionError as e:
+            logger.error("[ContentGen] ❌ Claude connection error: %s", e)
+            raise
+        except anthropic.APIStatusError as e:
+            logger.error("[ContentGen] ❌ Claude API error %s: %s", e.status_code, e.message)
+            raise
+        except Exception as e:
+            logger.error("[ContentGen] ❌ Unexpected Claude error: %s", e, exc_info=True)
+            raise
+
+    def _next_topic(self) -> str:
+        """Thread-safe topic cycling."""
+        with self._topic_lock:
+            topic = TOPIC_POOL[self._topic_index % len(TOPIC_POOL)]
+            self._topic_index += 1
+            return topic
 
     # ──────────────────────────────────────────────
     # Post Generation
@@ -64,9 +111,10 @@ His LinkedIn voice is:
     def generate_weekly_post(self, custom_topic: Optional[str] = None) -> str:
         """
         Generate a LinkedIn post for the week.
-        If custom_topic is None, cycles through the built-in topic pool.
+        Cycles through built-in topics or uses a custom topic if provided.
         """
-        topic = custom_topic or self._next_topic()
+        from datetime import datetime
+        topic    = custom_topic or self._next_topic()
         week_str = datetime.now().strftime("Week of %B %d, %Y")
 
         prompt = f"""{self.AUTHOR_PERSONA}
@@ -75,7 +123,7 @@ Write a compelling LinkedIn post for {week_str} on this topic:
 "{topic}"
 
 Requirements:
-- Length: 150–300 words
+- Length: 150–300 words (MUST stay under 3000 characters total)
 - Start with a strong hook (first line must grab attention — no "I am excited to share...")
 - Include 1–2 concrete technical insights or real-world observations
 - Mention a specific tool, framework, or architecture pattern
@@ -85,43 +133,32 @@ Requirements:
 
 Output ONLY the post text, nothing else.
 """
+        post_text = self._call_claude(prompt, max_tokens=600)
 
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        post_text = message.content[0].text.strip()
-        print(f"[ContentGen] ✅ Generated post on: {topic}")
+        # Safety: enforce LinkedIn character limit
+        if len(post_text) > _MAX_POST_CHARS:
+            logger.warning("[ContentGen] ⚠️  Post truncated from %d → %d chars.",
+                           len(post_text), _MAX_POST_CHARS)
+            post_text = post_text[:_MAX_POST_CHARS - 3] + "..."
+
+        logger.info("[ContentGen] ✅ Generated post on: %s", topic)
         return post_text
 
     def generate_post_on_topic(self, topic: str) -> str:
-        """Generate a post on a specific topic provided by the user."""
         return self.generate_weekly_post(custom_topic=topic)
-
-    def _next_topic(self) -> str:
-        topic = TOPIC_POOL[self._topic_index % len(TOPIC_POOL)]
-        self._topic_index += 1
-        return topic
 
     # ──────────────────────────────────────────────
     # Comment Reply Generation
     # ──────────────────────────────────────────────
 
-    def generate_comment_reply(
-        self,
-        original_post: str,
-        commenter_name: str,
-        comment_text: str,
-        previous_replies: list = None,
-    ) -> str:
-        """
-        Generate a contextual, human-sounding reply to a LinkedIn comment.
-        """
+    def generate_comment_reply(self, original_post: str, commenter_name: str,
+                                comment_text: str,
+                                previous_replies: Optional[list] = None) -> str:
+        """Generate a contextual reply to a LinkedIn comment."""
         context = ""
         if previous_replies:
             context = "\n\nPrevious replies in this thread:\n" + "\n".join(
-                [f"- {r}" for r in previous_replies[-3:]]  # last 3 replies for context
+                [f"- {r}" for r in previous_replies[-3:]]
             )
 
         prompt = f"""{self.AUTHOR_PERSONA}
@@ -139,83 +176,64 @@ Write a reply that:
 - Directly addresses what {commenter_name} said
 - Is warm and professional (not robotic)
 - Adds value: a quick insight, a follow-up question, or an acknowledgment with extra context
-- Is concise: 1–3 sentences max
+- Is concise: 1–3 sentences max (MUST stay under 1250 characters)
 - Do NOT start with "Great comment!" or "Thanks for sharing!" — be more specific
 - No hashtags in replies
 - Address them by first name if possible
 
 Output ONLY the reply text, nothing else.
 """
+        reply = self._call_claude(prompt, max_tokens=200)
 
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        reply = message.content[0].text.strip()
-        print(f"[ContentGen] ✅ Generated reply to {commenter_name}")
+        if len(reply) > _MAX_COMMENT_CHARS:
+            reply = reply[:_MAX_COMMENT_CHARS - 3] + "..."
+
+        logger.info("[ContentGen] ✅ Generated reply to %s", commenter_name)
         return reply
 
     # ──────────────────────────────────────────────
-    # Message (DM) Reply Generation
+    # DM Reply Generation
     # ──────────────────────────────────────────────
 
-    def generate_message_reply(
-        self,
-        sender_name: str,
-        message_text: str,
-        conversation_history: list = None,
-    ) -> str:
-        """
-        Generate a reply to a LinkedIn direct message.
-        Handles common scenarios: collaboration requests, job offers, questions, etc.
-        """
+    def generate_message_reply(self, sender_name: str, message_text: str,
+                                conversation_history: Optional[list] = None) -> str:
+        """Generate a reply to a LinkedIn direct message."""
         history_context = ""
         if conversation_history:
-            history_context = "\n\nPrevious messages in this conversation:\n"
+            history_context = "\n\nPrevious messages:\n"
             for msg in conversation_history[-4:]:
-                role = msg.get("role", "unknown")
-                text = msg.get("text", "")
-                history_context += f"{role}: {text}\n"
+                history_context += f"{msg.get('role', 'unknown')}: {msg.get('text', '')}\n"
 
         prompt = f"""{self.AUTHOR_PERSONA}
 
-Satyam received a LinkedIn direct message. Write a professional, personalized reply.
+Satyam received a LinkedIn direct message. Write a professional, personalised reply.
 
 Sender: {sender_name}
 Message: "{message_text}"
 {history_context}
 
-Guidelines for the reply:
-- Be genuine and professional
-- If it's a collaboration/consulting request: express interest and suggest a brief call
-- If it's a job offer: politely note Satyam is focused on his current work but thanks them
-- If it's a technical question: give a concise helpful answer and offer to connect further
-- If it's a connection request/introduction: be warm and welcoming
-- If it's spam or irrelevant: write a polite, brief decline
-- Keep it to 2–4 sentences
-- Do NOT sound like a bot — vary your opening
+Guidelines:
+- If collaboration/consulting request: express interest, suggest a brief call
+- If job offer: politely note current focus, thank them
+- If technical question: concise helpful answer, offer to connect further
+- If introduction/connection request: warm and welcoming
+- If spam/irrelevant: polite brief decline
+- Keep to 2–4 sentences, sound genuine not robotic
 
 Output ONLY the reply text, nothing else.
 """
-
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=250,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        reply = message.content[0].text.strip()
-        print(f"[ContentGen] ✅ Generated DM reply to {sender_name}")
+        reply = self._call_claude(prompt, max_tokens=250)
+        logger.info("[ContentGen] ✅ Generated DM reply to %s", sender_name)
         return reply
 
     # ──────────────────────────────────────────────
-    # Utility
+    # Comment Classification
     # ──────────────────────────────────────────────
 
     def classify_comment(self, comment_text: str) -> str:
         """
-        Classify a comment to help the agent decide the reply strategy.
-        Returns one of: 'question', 'praise', 'disagreement', 'spam', 'engagement'
+        Classify a comment: question | praise | disagreement | spam | engagement
+        Falls back to 'engagement' on any API error.
         """
         prompt = f"""Classify this LinkedIn comment into exactly one category:
 - question: asks a technical or general question
@@ -228,9 +246,11 @@ Comment: "{comment_text}"
 
 Output ONLY the category word, nothing else.
 """
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=10,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text.strip().lower()
+        try:
+            result = self._call_claude(prompt, max_tokens=10).lower()
+            if result not in ("question", "praise", "disagreement", "spam", "engagement"):
+                result = "engagement"
+            return result
+        except Exception:
+            logger.warning("[ContentGen] Comment classification failed, defaulting to 'engagement'.")
+            return "engagement"
