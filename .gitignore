@@ -1,0 +1,17 @@
+# Credentials — NEVER commit these
+.env
+data/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Playwright browser cache
+.playwright/

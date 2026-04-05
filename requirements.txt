@@ -1,0 +1,21 @@
+# LinkedIn AI Agent — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Core AI ─────────────────────────────────────────────────
+anthropic>=0.40.0          # Claude API client
+
+# ── LinkedIn API ─────────────────────────────────────────────
+requests>=2.31.0           # HTTP requests for LinkedIn REST API
+
+# ── Browser Automation (for comment/message monitoring) ──────
+playwright>=1.44.0         # Chromium browser automation
+# After installing, also run: playwright install chromium
+
+# ── Scheduling ───────────────────────────────────────────────
+APScheduler>=3.10.4        # Async job scheduler (cron + interval triggers)
+
+# ── Config / Environment ─────────────────────────────────────
+python-dotenv>=1.0.0       # Load .env file
+
+# ── Utilities ────────────────────────────────────────────────
+aiohttp>=3.9.0             # Async HTTP (optional, for future webhooks)
