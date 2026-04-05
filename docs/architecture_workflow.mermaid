@@ -1,0 +1,68 @@
+flowchart TD
+    subgraph TRIGGER["⏰ Triggers"]
+        T1["Weekly Cron\n(Tuesday 9AM)"]
+        T2["Every 30 Min\nEngagement Scan"]
+        T3["Manual CLI\n--post-now / --engage-now"]
+    end
+
+    subgraph CONTENT["📝 Content Generation (Claude AI)"]
+        CG1["Topic Selection\n(20-topic rotating pool)"]
+        CG2["Post Generation\nclaude-opus-4-6"]
+        CG3["Comment Classification\n(question/praise/spam...)"]
+        CG4["Reply Generation\nContextual AI Response"]
+        CG5["DM Reply Generation\nPersonalised AI Response"]
+    end
+
+    subgraph POSTING["📤 LinkedIn Posting"]
+        P1{"API Token\nValid?"}
+        P2["LinkedIn REST API\n/v2/ugcPosts"]
+        P3["Playwright Browser\nFallback Post"]
+        P4["Post Log\nposts_log.json"]
+    end
+
+    subgraph MONITOR["👁️ Browser Monitor (Playwright)"]
+        M1["Login / Restore Session\nlinkedin_session.json"]
+        M2["Scrape Notifications\n/notifications"]
+        M3["Scrape Post Comments\n.comments-comment-item"]
+        M4["Scrape DM Inbox\n/messaging — unread only"]
+    end
+
+    subgraph REPLY["💬 Reply Engine"]
+        R1{"Already\nReplied?"}
+        R2{"Spam?"}
+        R3["Post Comment Reply\nvia Browser"]
+        R4["DM Reply\nvia Browser"]
+        R5["Dedup State\nreplied_items.json"]
+    end
+
+    %% Trigger flows
+    T1 --> CG1
+    T3 --> CG1
+    T2 --> M1
+    T3 --> M1
+
+    %% Content flow
+    CG1 --> CG2 --> P1
+    P1 -->|Yes| P2 --> P4
+    P1 -->|No| P3 --> P4
+
+    %% Monitor flow
+    M1 --> M2 --> M3
+    M1 --> M4
+
+    %% Reply flow for comments
+    M3 --> R1
+    R1 -->|New| R2
+    R1 -->|Seen| R5
+    R2 -->|Yes| R5
+    R2 -->|No| CG3 --> CG4 --> R3 --> R5
+
+    %% Reply flow for DMs
+    M4 --> CG5 --> R4 --> R5
+
+    %% Styles
+    style TRIGGER fill:#1E3A5F,color:#fff,stroke:#4A90D9
+    style CONTENT fill:#1A4731,color:#fff,stroke:#27AE60
+    style POSTING fill:#4A1942,color:#fff,stroke:#9B59B6
+    style MONITOR fill:#4A2800,color:#fff,stroke:#E67E22
+    style REPLY fill:#1A3A4A,color:#fff,stroke:#3498DB
